@@ -1,27 +1,37 @@
     import { createGridFont } from './font.js';
     'use strict';
 
+
+    // CONFIG.initialKick = 12;
+    // CONFIG.collisionKick = 15;
+    // CONFIG.motionKick = 1.5;
+    // CONFIG.contactKick = 20;
+    // CONFIG.maxKick = 35;
     // ── Configuration ───────────────────────────────────────────────────────
     const CONFIG = {
       worldWidth: 100,
       goalOffset: 20,
       horizontalSpeed: 17,
-      gridSize: 6,
+      gridSize: 4,
       gridGap: 1,
       paddleWidth: 2,
       paddleHeight: 64,
-      paddleSpeed: 128,                 // grid rows / second
-      samples: 256,                    // power of two for FFT
+      paddleSpeed: 256,                 // grid rows / second
+      samples: 512,                    // power of two for FFT
       kinetic: 0.00022,
       initialWidth: 0.025,
       collapseWidth: 0.032,
-      initialKick: 26,
-      collisionKick: 66,
-      motionKick: 3.5,
-      contactKick: 95,
-      maxKick: 145,
+      initialKick: 12,
+      collisionKick: 30,
+      motionKick: 5.5,
+      contactKick: 20,
+      maxKick: 45,
       substeps: 3,
       maxFrameTime: 0.05,
+      couplingAngle: Math.PI / 2,
+      evolutionSpeed: 4,
+      maxMode: 12,
+      filterStrength: 0.15,
       colors: {
         background: '#c3d5af',
         real: 'rgb(2, 16, 11)',
@@ -53,7 +63,21 @@
     const keys = new Set();
 
     // Complex wavefunction and absorbed probability density (per sample).
-    const psi = { re: new Float64Array(N), im: new Float64Array(N) };
+    const psi = {
+        re: new Float64Array(N),
+        im: new Float64Array(N)
+    };
+
+    const psiLeft = {
+        re: new Float64Array(N),
+        im: new Float64Array(N)
+    };
+
+    const psiRight = {
+        re: new Float64Array(N),
+        im: new Float64Array(N)
+    };
+
     const goals = {
       left: { density: new Float64Array(N), probability: 0 },
       right: { density: new Float64Array(N), probability: 0 },
@@ -73,6 +97,7 @@
       paused: false,
       flash: 0,
       lastTime: null,
+      measure: null,
     };
 
     const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
@@ -107,6 +132,16 @@
       return total * dy;
     }
 
+    function getProbability(wave) {
+        let total = 0;
+
+        for (let j = 0; j < N; j++) {
+            total += wave.re[j] ** 2 + wave.im[j] ** 2;
+        }
+
+        return total * dy;
+    }
+
     function normalize(target = 1) {
       const current = centralProbability();
       if (current < 1e-15) return;
@@ -116,6 +151,40 @@
         psi.im[j] *= factor;
       }
     }
+
+    function normalizeAll() {
+        const total =
+            getProbability(psi) +
+            getProbability(psiLeft) +
+            getProbability(psiRight);
+
+        if (total < 1e-15) return;
+
+        const factor = 1 / Math.sqrt(total);
+
+        for (const wave of [psi, psiLeft, psiRight]) {
+            for (let j = 0; j < N; j++) {
+                wave.re[j] *= factor;
+                wave.im[j] *= factor;
+            }
+        }
+    }
+
+    function coupleWaves(a, b, j, angle) {
+      const c = Math.cos(angle);
+      const s = Math.sin(angle);
+
+      const ar = a.re[j];
+      const ai = a.im[j];
+      const br = b.re[j];
+      const bi = b.im[j];
+
+      a.re[j] = c * ar - s * bi;
+      a.im[j] = c * ai + s * br;
+
+      b.re[j] = c * br - s * ai;
+      b.im[j] = c * bi + s * ar;
+  }
 
     // Gaussian on [0,1], with hard walls enforced by odd FFT extension.
     function gaussian(center, width, momentum) {
@@ -183,36 +252,54 @@
     }
 
 
-    function evolve(dt) {
-      const size = 2 * N;
+    function evolve(dt, wave, mid=true) {
+        const size = 2 * N;
+        const multiplier = mid ? 1 : .020
 
-      for (let j = 0; j < N; j++) {
-        fftReal[j] = psi.re[j];
-        fftImaginary[j] = psi.im[j];
-        fftReal[size - 1 - j] = -psi.re[j];
-        fftImaginary[size - 1 - j] = -psi.im[j];
-      }
+        for (let j = 0; j < N; j++) {
+            fftReal[j] = wave.re[j];
+            fftImaginary[j] = wave.im[j];
 
-      fft(fftReal, fftImaginary);
+            fftReal[size - 1 - j] = -wave.re[j];
+            fftImaginary[size - 1 - j] = -wave.im[j];
+        }
 
-      for (let j = 0; j < size; j++) {
-        const mode = j <= size / 2 ? j : j - size;
-        const k = Math.PI * mode; // mirrored domain length = 2
-        const angle = -CONFIG.kinetic * k * k * dt;
-        const co = Math.cos(angle);
-        const si = Math.sin(angle);
-        const a = fftReal[j];
-        const b = fftImaginary[j];
-        fftReal[j] = a * co - b * si;
-        fftImaginary[j] = a * si + b * co;
-      }
+        fft(fftReal, fftImaginary);
 
-      fft(fftReal, fftImaginary, true);
+        for (let j = 0; j < size; j++) {
+          const mode = j <= size / 2 ? j : j - size;
+          const k = Math.PI * mode;
+          const angle = -CONFIG.kinetic * k * k * dt;
 
-      for (let j = 0; j < N; j++) {
-        psi.re[j] = fftReal[j];
-        psi.im[j] = fftImaginary[j];
-      }
+          const co = Math.cos(angle);
+          const si = Math.sin(angle);
+
+          const a = fftReal[j];
+          const b = fftImaginary[j];
+
+          // Suppress frequencies above maxMode
+          const excess = Math.max(0, Math.abs(mode) - CONFIG.maxMode);
+
+          const filter = Math.exp(
+              -CONFIG.filterStrength * excess * excess * multiplier * dt
+          );
+
+          fftReal[j] = (a * co - b * si) * filter;
+          fftImaginary[j] = (a * si + b * co) * filter;
+        }
+
+        fft(fftReal, fftImaginary, true);
+
+        for (let j = 0; j < N; j++) {
+            wave.re[j] = fftReal[j];
+            wave.im[j] = fftImaginary[j];
+        }
+    }
+
+    function evolveAll(dt) {
+        evolve(dt, psi);
+        evolve(dt, psiLeft, false);
+        evolve(dt, psiRight, false);
     }
 
     function applyMomentum(kick, center) {
@@ -227,107 +314,167 @@
       }
     }
 
+    function interferenceAt(goal, j) {
+        const ar = psi.re[j];
+        const ai = psi.im[j];
+
+        const br = goal.re[j];
+        const bi = goal.im[j];
+
+        const magnitudeA = Math.hypot(ar, ai);
+        const magnitudeB = Math.hypot(br, bi);
+
+        if (magnitudeA * magnitudeB < 1e-10) return 0;
+
+        return (bi * ar - br * ai) / (magnitudeA * magnitudeB);
+    }
+
+    function interferenceColor(value) {
+        const t = Math.max(0, Math.min(1, (value + 1) / 2));
+
+        // real: 'rgb(2, 16, 11)',
+        // imaginary: 'rgb(106, 135, 99)',
+
+        const green = [106, 135, 99];
+        const red = [255,255,255];
+        const neutral = [2, 16, 11];
+
+        const a = t < 0.5 ? red : neutral;
+        const b = t < 0.5 ? neutral : green;
+        const f = t < 0.5 ? t * 2 : (t - 0.5) * 2;
+
+        const rgb = a.map((v, i) =>
+            Math.round(v + (b[i] - v) * f)
+        );
+
+        return `rgb(${rgb[0]}, ${rgb[1]}, ${rgb[2]})`;
+    }
+
+    function smoothstep(a, b, x) {
+        const t = Math.max(0, Math.min(1, (x - a) / (b - a)));
+        return t * t * (3 - 2 * t);
+    }
+
+    function captureStrength(row, top, bottom) {
+        const feather = 8; // grid rows
+
+        const upper = smoothstep(top - feather, top, row);
+        const lower = 1 - smoothstep(bottom, bottom + feather, row);
+
+        const coverage = upper * lower;
+
+        return 1 - coverage;
+    }
+
     // ── Gameplay ────────────────────────────────────────────────────────────
     function collide(side) {
-      const paddle = paddles[side];
-      const top = Math.round(paddle.row);
-      const goal = goals[side];
-      let captured = 0;
-      let remaining = 0;
-      let centroid = 0;
+    const paddle = paddles[side];
+    const goal = side === 'left' ? psiLeft : psiRight;
 
-      for (let j = 0; j < N; j++) {
+    const top = Math.round(paddle.row);
+    const bottom = top + CONFIG.paddleHeight;
+
+    // Transfer amplitude between the central and goal waves
+    for (let j = 0; j < N; j++) {
         const row = sampleRow(j);
-        const probability = (psi.re[j] ** 2 + psi.im[j] ** 2) * dy;
-        const covered = row >= top && row < top + CONFIG.paddleHeight;
 
-        if (covered) {
-          remaining += probability;
-          centroid += probability * sampleY(j);
-        } else {
-          captured += probability;
-          goal.density[j] += probability;
-          psi.re[j] = 0;
-          psi.im[j] = 0;
-        }
-      }
-      goal.probability += captured;
+        const strength = captureStrength(row, top, bottom);
 
-      if (remaining > 1e-12) {
-        centroid /= remaining;
-        game.bounces++;
-        const paddleCenter = (top + CONFIG.paddleHeight / 2) / screen.rows;
-        const contact = clamp(centroid - paddleCenter, -0.5, 0.5);
-        const baseline = (game.bounces % 2 ? 1 : -1) * CONFIG.collisionKick;
-        game.kick = clamp(
-          baseline + paddle.velocity * CONFIG.motionKick + contact * CONFIG.contactKick,
-          -CONFIG.maxKick,
-          CONFIG.maxKick
+        coupleWaves(
+            psi,
+            goal,
+            j,
+            CONFIG.couplingAngle * strength
         );
-        applyMomentum(game.kick, centroid);
-      }
-
-      game.vx = side === 'left' ? Math.abs(game.vx) : -Math.abs(game.vx);
-      game.phase += Math.PI;
     }
+
+    // Reflect horizontal movement
+    game.vx = side === 'left'
+        ? Math.abs(CONFIG.horizontalSpeed)
+        : -Math.abs(CONFIG.horizontalSpeed);
+
+    // Apply vertical momentum kick to the surviving central wave
+    const direction = side === 'left' ? 1 : -1;
+
+    const kick = clamp(
+        direction * CONFIG.collisionKick
+        + paddle.velocity * CONFIG.motionKick,
+        -CONFIG.maxKick,
+        CONFIG.maxKick
+    );
+
+    applyMomentum(kick, 0.5);
+
+    game.kick = kick;
+    game.bounces++;
+}
 
     function reset() {
-      for (const goal of Object.values(goals)) {
-        goal.density.fill(0);
-        goal.probability = 0;
-      }
-      game.x = 0;
-      game.vx = CONFIG.horizontalSpeed;
-      game.phase = 0;
-      game.bounces = 0;
-      game.kick = CONFIG.initialKick;
-      game.flash = 0;
-      game.paused = false;
-      gaussian(0.5, CONFIG.initialWidth, game.kick);
-    }
+    psiLeft.re.fill(0);
+    psiLeft.im.fill(0);
+    psiRight.re.fill(0);
+    psiRight.im.fill(0);
 
-    function sampleCentralPosition(total) {
-      const target = Math.random() * total;
-      let accumulated = 0;
-      for (let j = 0; j < N; j++) {
-        accumulated += (psi.re[j] ** 2 + psi.im[j] ** 2) * dy;
-        if (accumulated >= target) return sampleY(j);
-      }
-      return 0.5;
-    }
+    game.x = 0;
+    game.vx = CONFIG.horizontalSpeed;
+    game.phase = 0;
+    game.bounces = 0;
+    game.kick = CONFIG.initialKick;
+    game.flash = 0;
+    game.paused = false;
+    game.lastTime = null;
+    game.message = null
 
-    function measure() {
-      if (game.paused) return;
-      const center = centralProbability();
-      const total = goals.left.probability + goals.right.probability + center;
-      if (total <= 0) return;
-      const outcome = Math.random() * total;
+    gaussian(0.5, CONFIG.initialWidth, game.kick);
+}
 
-      if (outcome < goals.left.probability) {
-        // ui.message.textContent = 'Particle in LEFT goal — right player scores! Press R';
+function measure() {
+    if (game.paused) return;
+
+    const left = getProbability(psiLeft);
+    const right = getProbability(psiRight);
+    const center = centralProbability();
+    const total = left + right + center;
+
+    if (total <= 0) return;
+
+    const outcome = Math.random() * total;
+
+    // Particle detected in left goal
+    if (outcome < left) {
+        game.message = "PARTICLE IN LEFT GOAL - PLAYER 2 SCORES";
         game.paused = true;
         return;
-      }
-      if (outcome < goals.left.probability + goals.right.probability) {
-        // ui.message.textContent = 'Particle in RIGHT goal — left player scores! Press R';
+    }
+
+    // Particle detected in right goal
+    if (outcome < left + right) {
+        game.message = "PARTICLE IN RIGHT GOAL - PLAYER 1 SCORES";
         game.paused = true;
         return;
-      }
-
-      // A central outcome rules out both goals: reset them and localize the wave.
-      const position = sampleCentralPosition(center);
-      for (const goal of Object.values(goals)) {
-        goal.density.fill(0);
-        goal.probability = 0;
-      }
-      game.bounces = 0;
-      game.kick = (Math.random() < 0.5 ? -1 : 1) * (65 + Math.random() * 35);
-      gaussian(position, CONFIG.collapseWidth, game.kick);
-      game.x = 0;
-      game.vx = (Math.random() < 0.5 ? -1 : 1) * CONFIG.horizontalSpeed;
-      game.flash = 0.45;
-      // ui.message.textContent = 'Central measurement: localized, new vertical momentum';
     }
+
+    // Particle detected in central region
+    const position = sampleCentralPosition(center);
+
+    psiLeft.re.fill(0);
+    psiLeft.im.fill(0);
+    psiRight.re.fill(0);
+    psiRight.im.fill(0);
+
+    game.bounces = 0;
+    game.kick = (Math.random() < 0.5 ? -1 : 1)
+        * (65 + Math.random() * 35);
+
+    gaussian(position, CONFIG.collapseWidth, game.kick);
+
+    game.x = 0;
+    game.vx = (Math.random() < 0.5 ? -1 : 1)
+        * CONFIG.horizontalSpeed;
+
+    game.flash = 0.45;
+    game.message = null;
+}
 
     // ── Input ───────────────────────────────────────────────────────────────
     const handledKeys = new Set(['KeyW', 'KeyS', 'ArrowUp', 'ArrowDown', 'Space', 'KeyR']);
@@ -406,25 +553,78 @@
       }
     }
 
-    function drawWave() {
-      const centerCol = nearestCol(worldX(game.x));
-      for (let row = 0; row < screen.rows; row++) {
-        drawCell(centerCol, row, CONFIG.colors.center);
-      }
+  function sampleCentralPosition(total = centralProbability()) {
+    const target = Math.random() * total;
+    let accumulated = 0;
 
-      // Normalize only the visual scale; do not renormalize physical probability.
-      let maximum = 0;
-      for (let j = 0; j < N; j++) {
-        maximum = Math.max(maximum, Math.hypot(psi.re[j], psi.im[j]));
-      }
-      const gain = maximum > 1e-10 ? Math.min(6, 4 / maximum) : 0;
+    for (let j = 0; j < N; j++) {
+        accumulated += (
+            psi.re[j] ** 2 +
+            psi.im[j] ** 2
+        ) * dy;
 
-      for (let row = 0; row < screen.rows; row++) {
-        const j = Math.min(N - 1, Math.floor((row + 0.5) / screen.rows * N));
-        drawCell(nearestCol(worldX(game.x + psi.im[j] * gain)), row, CONFIG.colors.imaginary);
-        drawCell(nearestCol(worldX(game.x + psi.re[j] * gain)), row, CONFIG.colors.real);
-      }
+        if (accumulated >= target) {
+            return sampleY(j);
+        }
     }
+
+    return 0.5;
+}
+
+function drawWave(wave, x, side = null) {
+    let maximum = 0;
+
+    for (let j = 0; j < N; j++) {
+        maximum = Math.max(
+            maximum,
+            wave.re[j] ** 2 + wave.im[j] ** 2
+        );
+    }
+
+    const gain = maximum > 1e-10
+        ? Math.min(6, 4 / maximum)
+        : 0;
+    // const gain = .8
+
+    for (let row = 0; row < screen.rows; row++) {
+        const displayRow = game.flipY
+            ? screen.rows - 1 - row
+            : row;
+
+        const j = Math.min(
+            N - 1,
+            Math.floor((displayRow + 0.5) / screen.rows * N)
+        );
+
+        const density = wave.re[j] ** 2 + wave.im[j] ** 2;
+        const real = wave.re[j];
+
+        let densityColor = CONFIG.colors.real;
+        let realColor = 'rgba(2, 16, 11, 0.25)';
+
+        if (side !== null) {
+            const interference = interferenceAt(wave, j);
+            densityColor = interferenceColor(interference);
+
+            // Keep the real component visually subordinate
+            realColor = 'rgba(2, 16, 11, 0.20)';
+        }
+
+        // Real component (faint)
+        drawCell(
+            nearestCol(worldX(x + real * gain)),
+            row,
+            realColor
+        );
+
+        // Probability density (prominent)
+        drawCell(
+            nearestCol(worldX(x + density * gain)),
+            row,
+            densityColor
+        );
+    }
+}
 
     function render() {
       ctx.fillStyle = CONFIG.colors.background;
@@ -434,12 +634,16 @@
       const rightCol = nearestCol(worldX(bound));
       drawCenterLine()
       drawGoals(leftCol, rightCol);
-      drawWave();
+      const goalX = CONFIG.worldWidth / 2 - CONFIG.goalOffset / 2;
+
+      drawWave(psiLeft, -goalX, 'left');
+      drawWave(psi, game.x);
+      drawWave(psiRight, goalX, 'right');
       drawPaddle('left', -bound);
       drawPaddle('right', bound);
 
         write(
-            `${Math.round(goals.left.probability * 100)}%`,
+            `${Math.round(getProbability(psiLeft) * 100)}%`,
             {
                 x: worldX(-CONFIG.worldWidth / 2 + CONFIG.goalOffset / 2)
                 / CONFIG.gridSize,
@@ -449,7 +653,7 @@
         );
 
         write(
-            `${Math.round(goals.right.probability * 100)}%`,
+            `${Math.round(getProbability(psiRight) * 100)}%`,
             {
                 x: worldX(CONFIG.worldWidth / 2 - CONFIG.goalOffset / 2)
                 / CONFIG.gridSize,
@@ -467,6 +671,26 @@
             },
             "center"
         );
+
+        if (game.message) {
+            write(
+                game.message,
+                {
+                    x: screen.cols / 2,
+                    y: (screen.rows - 16) / 2
+                },
+                "center"
+            );
+
+            write(
+                "PRESS R TO RESET",
+                {
+                    x: screen.cols / 2,
+                    y: (screen.rows + 2) / 2
+                },
+                "center"
+            );
+        }
 
       // ui.left.textContent = `LEFT goal: ${(goals.left.probability * 100).toFixed(1)}%`;
       // ui.center.textContent = `IN PLAY: ${(centralProbability() * 100).toFixed(1)}% · kick ${game.kick.toFixed(0)}`;
@@ -487,8 +711,11 @@
       if (!game.paused) {
         movePaddles(dt);
         for (let step = 0; step < CONFIG.substeps; step++) {
-          evolve(dt / CONFIG.substeps);
+              evolveAll(
+                  dt * CONFIG.evolutionSpeed / CONFIG.substeps
+              );
         }
+        normalizeAll();
         game.x += game.vx * dt;
         const bound = CONFIG.worldWidth / 2 - CONFIG.goalOffset;
         if (game.x >= bound) {
