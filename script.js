@@ -190,7 +190,6 @@ function animate(timestamp) {
     ctx.clearRect(0, 0, W, H);
     ctx.lineWidth = 5;
     
-    drawY(x0, true); // Imaginary part: green
     drawY(x0);       // Real part: white
 
     drawPaddle(-L / 2 + offset, Math.round(leftPaddleY));

@@ -17,27 +17,30 @@
       paddleWidth: 2,
       paddleHeight: 64,
       paddleSpeed: 256,                 // grid rows / second
-      samples: 512,                    // power of two for FFT
+      samples: 1024,                    // power of two for FFT
       kinetic: 0.00022,
       initialWidth: 0.025,
       collapseWidth: 0.032,
-      initialKick: 12,
-      collisionKick: 30,
-      motionKick: 5.5,
+      initialKick: 18,
+      collisionKick: 8,
+      motionKick: 30,                   // kick at full paddle speed
       contactKick: 20,
-      maxKick: 45,
+      maxKick: 38,
       substeps: 3,
       maxFrameTime: 0.05,
+      winningScore: 5,
+      particleRadius: 10,
       couplingAngle: Math.PI / 2,
       evolutionSpeed: 4,
-      maxMode: 12,
-      filterStrength: 0.15,
+      maxMode: 10,
+      filterStartMode: 5,
+      filterStrength: 3,
       colors: {
-        background: '#c3d5af',
+        background: '#edf4df',
         real: 'rgb(2, 16, 11)',
-        imaginary: 'rgb(106, 135, 99)',
+        imaginary: 'rgb(79, 99, 65)',
         goal: 'rgba(2, 16, 11, 0.45)',
-        center: 'rgba(2, 16, 11, 0.10)',
+        center: 'rgba(2, 16, 11, 0.55)',
       },
     };
 
@@ -98,6 +101,10 @@
       flash: 0,
       lastTime: null,
       measure: null,
+      scores: { left: 0, right: 0 },
+      winner: null,
+      mode: 'wave',
+      particle: null,
     };
 
     const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
@@ -108,8 +115,14 @@
 
     function resize() {
       const oldRows = screen.rows;
-      screen.width = canvas.width = window.innerWidth;
-      screen.height = canvas.height = window.innerHeight;
+      screen.width = window.innerWidth;
+      screen.height = window.innerHeight;
+      const pixelRatio = window.devicePixelRatio || 1;
+      canvas.width = Math.round(screen.width * pixelRatio);
+      canvas.height = Math.round(screen.height * pixelRatio);
+      canvas.style.width = `${screen.width}px`;
+      canvas.style.height = `${screen.height}px`;
+      ctx.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
       screen.scale = screen.width / CONFIG.worldWidth;
       screen.rows = Math.ceil(screen.height / CONFIG.gridSize);
       screen.cols = Math.ceil(screen.width / CONFIG.gridSize);
@@ -196,6 +209,7 @@
         psi.im[j] = envelope * Math.sin(angle);
       }
       normalize();
+      evolve(0, psi);
     }
 
     // Odd mirror extension makes the existing FFT obey hard-wall boundaries.
@@ -252,9 +266,9 @@
     }
 
 
-    function evolve(dt, wave, mid=true) {
+    function evolve(dt, wave) {
         const size = 2 * N;
-        const multiplier = mid ? 1 : .020
+        const probabilityBefore = getProbability(wave);
 
         for (let j = 0; j < N; j++) {
             fftReal[j] = wave.re[j];
@@ -277,11 +291,12 @@
           const a = fftReal[j];
           const b = fftImaginary[j];
 
-          // Suppress frequencies above maxMode
-          const excess = Math.max(0, Math.abs(mode) - CONFIG.maxMode);
-
-          const filter = Math.exp(
-              -CONFIG.filterStrength * excess * excess * multiplier * dt
+          // Hard cap complexity; smoothly damp the upper retained modes.
+          const modeMagnitude = Math.abs(mode);
+          const taper = Math.max(0, modeMagnitude - CONFIG.filterStartMode)
+              / (CONFIG.maxMode - CONFIG.filterStartMode);
+          const filter = modeMagnitude > CONFIG.maxMode ? 0 : Math.exp(
+              -CONFIG.filterStrength * taper ** 4 * dt
           );
 
           fftReal[j] = (a * co - b * si) * filter;
@@ -294,12 +309,22 @@
             wave.re[j] = fftReal[j];
             wave.im[j] = fftImaginary[j];
         }
+
+        // Filtering changes shape without moving probability between regions.
+        const probabilityAfter = getProbability(wave);
+        if (probabilityAfter > 0) {
+            const scale = Math.sqrt(probabilityBefore / probabilityAfter);
+            for (let j = 0; j < N; j++) {
+                wave.re[j] *= scale;
+                wave.im[j] *= scale;
+            }
+        }
     }
 
     function evolveAll(dt) {
         evolve(dt, psi);
-        evolve(dt, psiLeft, false);
-        evolve(dt, psiRight, false);
+        evolve(dt, psiLeft);
+        evolve(dt, psiRight);
     }
 
     function applyMomentum(kick, center) {
@@ -330,23 +355,13 @@
     }
 
     function interferenceColor(value) {
-        const t = Math.max(0, Math.min(1, (value + 1) / 2));
-
-        // real: 'rgb(2, 16, 11)',
-        // imaginary: 'rgb(106, 135, 99)',
-
-        const green = [106, 135, 99];
-        const red = [255,255,255];
+        // Goal coupling adds i * psi: positive cross terms increase goal density.
+        const strength = clamp(Math.abs(value), 0, 1);
         const neutral = [2, 16, 11];
-
-        const a = t < 0.5 ? red : neutral;
-        const b = t < 0.5 ? neutral : green;
-        const f = t < 0.5 ? t * 2 : (t - 0.5) * 2;
-
-        const rgb = a.map((v, i) =>
-            Math.round(v + (b[i] - v) * f)
+        const target = value >= 0 ? [195, 25, 30] : [15, 115, 40];
+        const rgb = neutral.map((channel, i) =>
+            Math.round(channel + (target[i] - channel) * strength)
         );
-
         return `rgb(${rgb[0]}, ${rgb[1]}, ${rgb[2]})`;
     }
 
@@ -388,6 +403,11 @@
         );
     }
 
+    reflectWave(side);
+}
+
+function reflectWave(side) {
+    const paddle = paddles[side];
     // Reflect horizontal movement
     game.vx = side === 'left'
         ? Math.abs(CONFIG.horizontalSpeed)
@@ -396,25 +416,33 @@
     // Apply vertical momentum kick to the surviving central wave
     const direction = side === 'left' ? 1 : -1;
 
+    const speedFraction = clamp(paddle.velocity / CONFIG.paddleSpeed, -1, 1);
     const kick = clamp(
         direction * CONFIG.collisionKick
-        + paddle.velocity * CONFIG.motionKick,
+        + speedFraction * CONFIG.motionKick,
         -CONFIG.maxKick,
         CONFIG.maxKick
     );
 
     applyMomentum(kick, 0.5);
+    evolveAll(0);
 
     game.kick = kick;
     game.bounces++;
 }
 
-    function reset() {
+    function reset(newMatch = false) {
+    if (newMatch) {
+        game.scores.left = game.scores.right = 0;
+        game.winner = null;
+    }
     psiLeft.re.fill(0);
     psiLeft.im.fill(0);
     psiRight.re.fill(0);
     psiRight.im.fill(0);
 
+    game.mode = 'wave';
+    game.particle = null;
     game.x = 0;
     game.vx = CONFIG.horizontalSpeed;
     game.phase = 0;
@@ -428,52 +456,108 @@
     gaussian(0.5, CONFIG.initialWidth, game.kick);
 }
 
-function measure() {
-    if (game.paused) return;
+function scoreGoal(player) {
+    game.scores[player]++;
+    const playerNumber = player === 'left' ? 1 : 2;
+    if (game.scores[player] >= CONFIG.winningScore) {
+        game.winner = player;
+        game.message = `PLAYER ${playerNumber} WINS!`;
+    } else {
+        game.message = `PLAYER ${playerNumber} SCORES!`;
+    }
+    game.paused = true;
+}
 
+function clearWaves() {
+    for (const wave of [psi, psiLeft, psiRight]) {
+        wave.re.fill(0);
+        wave.im.fill(0);
+    }
+}
+
+function sampleWavePosition(wave, total = getProbability(wave)) {
+    const target = Math.random() * total;
+    let accumulated = 0;
+    for (let j = 0; j < N; j++) {
+        accumulated += (wave.re[j] ** 2 + wave.im[j] ** 2) * dy;
+        if (accumulated >= target) return sampleY(j);
+    }
+    return 0.5;
+}
+
+function measure() {
+    if (game.paused || game.mode !== 'wave') return;
     const left = getProbability(psiLeft);
     const right = getProbability(psiRight);
     const center = centralProbability();
     const total = left + right + center;
-
     if (total <= 0) return;
-
     const outcome = Math.random() * total;
-
-    // Particle detected in left goal
-    if (outcome < left) {
-        game.message = "PARTICLE IN LEFT GOAL - PLAYER 2 SCORES";
-        game.paused = true;
-        return;
-    }
-
-    // Particle detected in right goal
-    if (outcome < left + right) {
-        game.message = "PARTICLE IN RIGHT GOAL - PLAYER 1 SCORES";
-        game.paused = true;
-        return;
-    }
-
-    // Particle detected in central region
-    const position = sampleCentralPosition(center);
-
-    psiLeft.re.fill(0);
-    psiLeft.im.fill(0);
-    psiRight.re.fill(0);
-    psiRight.im.fill(0);
-
-    game.bounces = 0;
-    game.kick = (Math.random() < 0.5 ? -1 : 1)
-        * (65 + Math.random() * 35);
-
-    gaussian(position, CONFIG.collapseWidth, game.kick);
-
-    game.x = 0;
-    game.vx = (Math.random() < 0.5 ? -1 : 1)
-        * CONFIG.horizontalSpeed;
-
-    game.flash = 0.45;
+    const region = outcome < left ? 'left' : outcome < left + right ? 'right' : 'field';
+    const wave = region === 'left' ? psiLeft : region === 'right' ? psiRight : psi;
+    const y = sampleWavePosition(wave);
+    const j = clamp(Math.floor(y * N), 1, N - 2);
+    const density = wave.re[j] ** 2 + wave.im[j] ** 2;
+    // Local phase gradient carries the packet's vertical momentum into Pong.
+    const momentum = density > 1e-12 ? (
+        wave.re[j] * (wave.im[j + 1] - wave.im[j - 1])
+        - wave.im[j] * (wave.re[j + 1] - wave.re[j - 1])
+    ) / (2 * dy * density) : 0;
+    const goalX = CONFIG.worldWidth / 2 - CONFIG.goalOffset / 2;
+    game.particle = {
+        x: region === 'field' ? game.x : region === 'left' ? -goalX : goalX,
+        y,
+        vy: 2 * CONFIG.kinetic * CONFIG.evolutionSpeed * clamp(momentum, -CONFIG.maxKick, CONFIG.maxKick),
+        region,
+    };
+    clearWaves();
+    game.mode = 'particle';
     game.message = null;
+    if (region !== 'field') scoreGoal(region === 'left' ? 'right' : 'left');
+}
+
+function moveParticle(dt) {
+    const particle = game.particle;
+    particle.x += game.vx * dt;
+    particle.y += particle.vy * dt;
+    const radiusY = CONFIG.particleRadius / screen.height;
+    if (particle.y < radiusY) {
+        particle.y = 2 * radiusY - particle.y;
+        particle.vy = Math.abs(particle.vy);
+    } else if (particle.y > 1 - radiusY) {
+        particle.y = 2 * (1 - radiusY) - particle.y;
+        particle.vy = -Math.abs(particle.vy);
+    }
+    const bound = CONFIG.worldWidth / 2 - CONFIG.goalOffset;
+    const side = game.vx > 0 ? 'right' : 'left';
+    if ((game.vx > 0 && particle.x < bound) || (game.vx < 0 && particle.x > -bound)) return;
+    const paddle = paddles[side];
+    const row = particle.y * screen.rows;
+    const radiusRows = CONFIG.particleRadius / CONFIG.gridSize;
+    if (!particle.missedPaddle && row >= paddle.row - radiusRows && row <= paddle.row + CONFIG.paddleHeight + radiusRows) {
+        // The first paddle return ends classical Pong and starts dispersion.
+        game.x = side === 'left' ? -bound : bound;
+        gaussian(particle.y, CONFIG.collapseWidth,
+            clamp(particle.vy / (2 * CONFIG.kinetic * CONFIG.evolutionSpeed), -CONFIG.maxKick, CONFIG.maxKick));
+        reflectWave(side);
+        game.mode = 'wave';
+        game.particle = null;
+    } else {
+        particle.missedPaddle = true;
+        const goalX = CONFIG.worldWidth / 2 - CONFIG.goalOffset / 2;
+        if (Math.abs(particle.x) < goalX) return;
+        particle.x = side === 'left' ? -goalX : goalX;
+        particle.region = side;
+        scoreGoal(side === 'left' ? 'right' : 'left');
+    }
+}
+
+function drawParticle() {
+    const particle = game.particle;
+    ctx.fillStyle = CONFIG.colors.real;
+    ctx.beginPath();
+    ctx.arc(worldX(particle.x), particle.y * screen.height, CONFIG.particleRadius, 0, 2 * Math.PI);
+    ctx.fill();
 }
 
     // ── Input ───────────────────────────────────────────────────────────────
@@ -484,7 +568,7 @@ function measure() {
       keys.add(event.code);
       if (event.repeat) return;
       if (event.code === 'Space') measure();
-      if (event.code === 'KeyR') reset();
+      if (event.code === 'KeyR') reset(game.winner !== null);
     });
     window.addEventListener('keyup', event => keys.delete(event.code));
     window.addEventListener('blur', () => keys.clear());
@@ -498,7 +582,10 @@ function measure() {
         Number(keys.has('ArrowDown')) - Number(keys.has('ArrowUp'))
       );
       for (const paddle of Object.values(paddles)) {
-        paddle.row = clamp(paddle.row + paddle.velocity * dt, 0, paddleLimit());
+        const previousRow = paddle.row;
+        paddle.row = clamp(previousRow + paddle.velocity * dt, 0, paddleLimit());
+        // Use actual movement: pushing against an edge must not add a kick.
+        paddle.velocity = dt > 0 ? (paddle.row - previousRow) / dt : 0;
       }
     }
 
@@ -572,57 +659,54 @@ function measure() {
 }
 
 function drawWave(wave, x, side = null) {
+    // Draw even for empty goal waves so zero always has a visible reference.
+    ctx.strokeStyle = CONFIG.colors.center;
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath();
+    ctx.moveTo(worldX(x), 0);
+    ctx.lineTo(worldX(x), screen.height);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
     let maximum = 0;
-
     for (let j = 0; j < N; j++) {
-        maximum = Math.max(
-            maximum,
-            wave.re[j] ** 2 + wave.im[j] ** 2
-        );
+        maximum = Math.max(maximum, wave.re[j] ** 2 + wave.im[j] ** 2);
     }
+    if (maximum < 1e-10) return;
+    const gain = Math.min(6, 4 / maximum);
+    // Goals point inward; the moving field points toward its destination.
+    const direction = side === 'left' ? 1
+        : side === 'right' ? -1
+        : game.vx >= 0 ? 1 : -1;
+    const pointX = j => worldX(x + direction * (wave.re[j] ** 2 + wave.im[j] ** 2) * gain);
+    const pointY = j => sampleY(j) * screen.height;
 
-    const gain = maximum > 1e-10
-        ? Math.min(6, 4 / maximum)
-        : 0;
-    // const gain = .8
-
-    for (let row = 0; row < screen.rows; row++) {
-        const displayRow = game.flipY
-            ? screen.rows - 1 - row
-            : row;
-
-        const j = Math.min(
-            N - 1,
-            Math.floor((displayRow + 0.5) / screen.rows * N)
-        );
-
-        const density = wave.re[j] ** 2 + wave.im[j] ** 2;
-        const real = wave.re[j];
-
-        let densityColor = CONFIG.colors.real;
-        let realColor = 'rgba(2, 16, 11, 0.25)';
-
-        if (side !== null) {
-            const interference = interferenceAt(wave, j);
-            densityColor = interferenceColor(interference);
-
-            // Keep the real component visually subordinate
-            realColor = 'rgba(2, 16, 11, 0.20)';
+    ctx.lineWidth = 4;
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    if (side === null) {
+        ctx.strokeStyle = CONFIG.colors.real;
+        ctx.beginPath();
+        ctx.moveTo(worldX(x), 0);
+        for (let j = 0; j < N; j++) ctx.lineTo(pointX(j), pointY(j));
+        ctx.lineTo(worldX(x), screen.height);
+        ctx.stroke();
+    } else {
+        // Goal colors retain the interference cue on the density curve only.
+        let previousX = worldX(x);
+        let previousY = 0;
+        for (let j = 0; j <= N; j++) {
+            const nextX = j < N ? pointX(j) : worldX(x);
+            const nextY = j < N ? pointY(j) : screen.height;
+            ctx.strokeStyle = interferenceColor(interferenceAt(wave, Math.min(j, N - 1)));
+            ctx.beginPath();
+            ctx.moveTo(previousX, previousY);
+            ctx.lineTo(nextX, nextY);
+            ctx.stroke();
+            previousX = nextX;
+            previousY = nextY;
         }
-
-        // Real component (faint)
-        drawCell(
-            nearestCol(worldX(x + real * gain)),
-            row,
-            realColor
-        );
-
-        // Probability density (prominent)
-        drawCell(
-            nearestCol(worldX(x + density * gain)),
-            row,
-            densityColor
-        );
     }
 }
 
@@ -636,14 +720,18 @@ function drawWave(wave, x, side = null) {
       drawGoals(leftCol, rightCol);
       const goalX = CONFIG.worldWidth / 2 - CONFIG.goalOffset / 2;
 
-      drawWave(psiLeft, -goalX, 'left');
-      drawWave(psi, game.x);
-      drawWave(psiRight, goalX, 'right');
+      if (game.mode === 'particle') {
+          drawParticle();
+      } else {
+          drawWave(psiLeft, -goalX, 'left');
+          drawWave(psi, game.x);
+          drawWave(psiRight, goalX, 'right');
+      }
       drawPaddle('left', -bound);
       drawPaddle('right', bound);
 
         write(
-            `${Math.round(getProbability(psiLeft) * 100)}%`,
+            `${game.mode === 'particle' ? (game.particle.region === 'left' ? 100 : 0) : Math.round(getProbability(psiLeft) * 100)}%`,
             {
                 x: worldX(-CONFIG.worldWidth / 2 + CONFIG.goalOffset / 2)
                 / CONFIG.gridSize,
@@ -653,7 +741,7 @@ function drawWave(wave, x, side = null) {
         );
 
         write(
-            `${Math.round(getProbability(psiRight) * 100)}%`,
+            `${game.mode === 'particle' ? (game.particle.region === 'right' ? 100 : 0) : Math.round(getProbability(psiRight) * 100)}%`,
             {
                 x: worldX(CONFIG.worldWidth / 2 - CONFIG.goalOffset / 2)
                 / CONFIG.gridSize,
@@ -663,7 +751,7 @@ function drawWave(wave, x, side = null) {
         );
 
         write(
-            `${Math.round(centralProbability() * 100)}%`,
+            `${game.mode === 'particle' ? (game.particle.region === 'field' ? 100 : 0) : Math.round(centralProbability() * 100)}%`,
             {
                 x: worldX(0) / CONFIG.gridSize,
                 y: ((CONFIG.goalOffset / 4) * screen.scale)
@@ -672,24 +760,33 @@ function drawWave(wave, x, side = null) {
             "center"
         );
 
-        if (game.message) {
-            write(
-                game.message,
-                {
-                    x: screen.cols / 2,
-                    y: (screen.rows - 16) / 2
-                },
-                "center"
-            );
+        // Keep scores distinct from the wave probability percentages.
+        ctx.fillStyle = CONFIG.colors.background;
+        ctx.fillRect(0, 0, screen.width, 48);
+        ctx.fillStyle = CONFIG.colors.real;
+        ctx.font = `bold ${Math.min(22, screen.width / 30)}px monospace`;
+        ctx.textBaseline = 'middle';
+        ctx.textAlign = 'left';
+        ctx.fillText(`PLAYER 1: ${game.scores.left}`, 16, 24);
+        ctx.textAlign = 'right';
+        ctx.fillText(`PLAYER 2: ${game.scores.right}`, screen.width - 16, 24);
+        ctx.textAlign = 'center';
+        ctx.font = `bold ${Math.min(16, screen.width / 40)}px monospace`;
+        ctx.fillText(`FIRST TO ${CONFIG.winningScore}`, screen.width / 2, 24);
 
-            write(
-                "PRESS R TO RESET",
-                {
-                    x: screen.cols / 2,
-                    y: (screen.rows + 2) / 2
-                },
-                "center"
-            );
+        if (game.message) {
+            const panelWidth = Math.min(screen.width - 32, 560);
+            ctx.fillStyle = CONFIG.colors.background;
+            ctx.fillRect((screen.width - panelWidth) / 2, screen.height / 2 - 64, panelWidth, 128);
+            ctx.strokeStyle = CONFIG.colors.real;
+            ctx.lineWidth = 2;
+            ctx.strokeRect((screen.width - panelWidth) / 2, screen.height / 2 - 64, panelWidth, 128);
+            ctx.fillStyle = CONFIG.colors.real;
+            ctx.font = `bold ${Math.min(30, panelWidth / 16)}px monospace`;
+            ctx.fillText(game.message, screen.width / 2, screen.height / 2 - 18);
+            ctx.font = `bold ${Math.min(18, panelWidth / 23)}px monospace`;
+            ctx.fillText(game.winner ? 'PRESS R FOR A NEW MATCH' : 'PRESS R FOR NEXT ROUND',
+                screen.width / 2, screen.height / 2 + 24);
         }
 
       // ui.left.textContent = `LEFT goal: ${(goals.left.probability * 100).toFixed(1)}%`;
@@ -710,6 +807,9 @@ function drawWave(wave, x, side = null) {
 
       if (!game.paused) {
         movePaddles(dt);
+        if (game.mode === 'particle') {
+            moveParticle(dt);
+        } else {
         for (let step = 0; step < CONFIG.substeps; step++) {
               evolveAll(
                   dt * CONFIG.evolutionSpeed / CONFIG.substeps
@@ -724,6 +824,7 @@ function drawWave(wave, x, side = null) {
         } else if (game.x <= -bound) {
           game.x = -bound;
           collide('left');
+        }
         }
         game.flash = Math.max(0, game.flash - dt);
       }
