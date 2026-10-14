@@ -1,5 +1,13 @@
 html, body {
     margin: 0;
     height: 100%;
-    overflow: hidden
+    overflow: hidden;
+    background: #10191f;
+    color: #e7efdf;
+    color-scheme: dark;
+}
+
+canvas {
+    display: block;
+    background: #10191f;
 }
